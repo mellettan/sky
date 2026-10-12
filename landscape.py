@@ -1,9 +1,11 @@
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
 EYE = 1.7
-SKY, SOLID, WINDOW, FAR = 0, 1, 2, 3
+SKY, SOLID, WINDOW, FAR, GROUND = 0, 1, 2, 3, 4
+LEAF_LIT, NEEDLE_LIT, BARK_LIT = 1, 2, 3
 
 MEADOW = np.array([60, 90, 40], float)
 WHEAT = np.array([190, 156, 82], float)
@@ -24,6 +26,21 @@ MEADOW_DRY = np.array([82, 100, 44], float)
 FIELD_EDGE = np.array([50, 76, 34], float)
 VILLAGE = (248.0, 0.6, 0.8)
 LIGHT = np.array([-0.45, 0.7, 0.55]) / np.linalg.norm([-0.45, 0.7, 0.55])
+
+
+@dataclass
+class Geo:
+    """Пейзаж для текущего вида: цвета и дальность пикселей, нормали для освещения Солнцем, точки земли."""
+    base: np.ndarray
+    depth: np.ndarray
+    kind: np.ndarray
+    wid: np.ndarray
+    lid: np.ndarray
+    ln: np.ndarray
+    lg: np.ndarray
+    la: np.ndarray
+    lm: np.ndarray
+    ground: tuple
 
 
 def smoothstep(e0, e1, x):
@@ -133,6 +150,7 @@ class Scene:
             o["D"] *= k
         self.road_az = az0 + (self.road_az - az0) / spread
         self.road_len = 330.0 * k
+        self.casters = [self._caster(t) for t in self.trees if t["D"] <= 120]
         self.stacks = [
             {"az": 14.0, "D": 110.0, "w": 5.0, "h": 3.6},
             {"az": 33.0, "D": 165.0, "w": 5.5, "h": 3.8},
@@ -147,10 +165,15 @@ class Scene:
         base = np.zeros((n, 3))
         kind = np.zeros(n, np.int8)
         wid = np.full(n, -1, np.int16)
+        lid = np.zeros(n, np.int8)
+        ln = np.zeros((n, 3))
+        lg = np.zeros((n, 3))
+        la = np.zeros(n)
+        lm = np.ones(n)
         azr = np.radians(az)
         altr = np.radians(alt)
 
-        def put(idx, mask, d, color, k=SOLID, house=-1):
+        def put(idx, mask, d, color, k=SOLID, house=-1, lit=None):
             sel = idx[mask]
             dd = d[mask] if isinstance(d, np.ndarray) else np.full(sel.shape, float(d))
             closer = dd < depth[sel]
@@ -162,15 +185,20 @@ class Scene:
                 base[sel] = color
             kind[sel] = k
             wid[sel] = house
+            lid[sel] = 0 if lit is None else lit[0]
+            if lit is not None:
+                for dst, src in zip((ln, lg, la, lm), lit[1:]):
+                    dst[sel] = src[mask][closer]
 
         g = np.nonzero(alt < 0)[0]
+        gx = gy = gf = np.zeros(0)
         if g.size:
             d = np.minimum(EYE / np.tan(-altr[g]), 1e6)
             sa, ca = np.abs(np.sin(azr[g])), np.abs(np.cos(azr[g]))
             fx = px_rad * (d * ca + d * d / EYE * sa)
             fy = px_rad * (d * sa + d * d / EYE * ca)
-            put(g, np.ones(g.size, bool), d, self._ground(d * np.sin(azr[g]), d * np.cos(azr[g]), fx, fy,
-                                                          azr[g], altr[g], px_rad))
+            gx, gy, gf = d * np.sin(azr[g]), d * np.cos(azr[g]), np.maximum(fx, fy)
+            put(g, np.ones(g.size, bool), d, self._ground(gx, gy, fx, fy, azr[g], altr[g], px_rad), GROUND)
 
         c = np.nonzero((alt < 7.5) & (alt > -0.5))[0]
         if c.size:
@@ -201,7 +229,8 @@ class Scene:
                 self._spruce(t, az, alt, altr, px_rad, put)
             else:
                 self._tree(t, az, alt, altr, px_rad, put)
-        return base, depth, kind, wid
+        own = kind[g] == GROUND
+        return Geo(base, depth, kind, wid, lid, ln, lg, la, lm, (g[own], gx[own], gy[own], gf[own]))
 
     def _local(self, az, alt, altr, az_c, d, half_w, top, bottom=None):
         hw = math.degrees(math.atan(half_w / d)) * 1.05 + 0.01
@@ -288,6 +317,18 @@ class Scene:
         side = np.argsort(np.abs(cx[:-1]) - 0.3 * cy[:-1])[::-1][:3]
         t["branches"] = [(cx[k] * 0.8, cy[k] * 0.8) for k in side]
 
+    def _lit(self, t, kind, n, a, g=None, m=None):
+        """Нормали из системы дерева (вправо, вверх, к зрителю) в мировую (восток, север, верх)."""
+        ra = math.radians(t["az"])
+        frame = np.array([[math.cos(ra), -math.sin(ra), 0.0], [0.0, 0.0, 1.0], [-math.sin(ra), -math.cos(ra), 0.0]])
+
+        def world(v):
+            v = np.stack(v, axis=-1)
+            return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-9) @ frame
+
+        zero = np.zeros((a.size, 3))
+        return (kind, world(n), zero if g is None else world(g), a, np.ones(a.size) if m is None else m)
+
     def _tree(self, t, az, alt, altr, px_rad, put):
         d, r, hc, tw = t["D"], t["r"], t["hc"], t["tw"]
         c, dx, hy = self._local(az, alt, altr, t["az"], d, r * 1.5, hc + r * 1.3)
@@ -316,8 +357,10 @@ class Scene:
             br = dist < bw
             wood |= br
             u = np.where(br & ~(np.abs(dx) < hw), 0.3, u)
-        bark = TRUNK * (0.62 + 0.42 * np.clip(0.5 - 0.5 * u, 0, 1) + 0.12 * detail * (fbm(dx / 0.1, hy / 0.8, p[2]) - 0.5) * 1.6)[:, None]
-        put(c, wood, d + 0.2, bark)
+        grain = 0.12 * detail * (fbm(dx / 0.1, hy / 0.8, p[2]) - 0.5) * 1.6
+        bark = TRUNK * (0.62 + 0.42 * np.clip(0.5 - 0.5 * u, 0, 1) + grain)[:, None]
+        u = np.clip(u, -1, 1)
+        put(c, wood, d + 0.2, bark, lit=self._lit(t, BARK_LIT, (u, 0 * u, np.sqrt(1 - u * u)), 0.55 + grain))
 
         cx, cy, cr, cz = t["clumps"]
         near = np.hypot(dx, hy - hc) < r * 1.35
@@ -339,9 +382,13 @@ class Scene:
         nz = np.sqrt(np.clip(1 - nx * nx - ny * ny, 0, 1))
         lam = np.clip(nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2], 0, 1)
         glob = np.clip(0.5 + 0.5 * (-0.5 * dx / r + 0.85 * (hy - hc) / r), 0, 1)
-        b = (0.12 + 0.55 * lam + 0.38 * glob) * (0.72 + 0.28 * nz)
-        b += detail * (0.2 * (h1 - 0.5) + 0.08 * np.sin(dx * 3.1 + p[4]) * np.sin(hy * 2.7))
-        put(c, crown, d, ramp(np.clip(b, 0, 1.05), LEAF_STOPS, LEAF_COLS))
+        m = 0.72 + 0.28 * nz
+        tex = detail * (0.2 * (h1 - 0.5) + 0.08 * np.sin(dx * 3.1 + p[4]) * np.sin(hy * 2.7))
+        b = (0.12 + 0.55 * lam + 0.38 * glob) * m + tex
+        gx, gy = dx / r, (hy - hc) / r
+        gz = np.sqrt(np.clip(1 - gx * gx - gy * gy, 0, 1))
+        lit = self._lit(t, LEAF_LIT, (nx, ny, nz), 0.24 * m + tex, (gx, gy, gz), m)
+        put(c, crown, d, ramp(np.clip(b, 0, 1.05), LEAF_STOPS, LEAF_COLS), lit=lit)
 
     def _spruce(self, t, az, alt, altr, px_rad, put):
         d, H, R, b0, tw = t["D"], t["h"], t["r"], t["b"], t["tw"]
@@ -355,7 +402,9 @@ class Scene:
         h1 = (fbm(dx / 0.2, hy / 0.2, p[0]) - 0.5) * 1.6 + 0.5
         thw = np.maximum(tw / 2 * (1 + 0.6 * np.exp(-np.maximum(hy, 0) / 0.3)), 0.45 * px)
         trunk = (np.abs(dx) < thw) & (hy >= 0) & (hy < H * 0.85)
-        put(c, trunk, d + 0.2, TRUNK * (0.7 + 0.3 * (dx < 0))[:, None])
+        u = np.clip(dx / thw, -1, 1)
+        put(c, trunk, d + 0.2, TRUNK * (0.7 + 0.3 * (dx < 0))[:, None],
+            lit=self._lit(t, BARK_LIT, (u, 0 * u, np.sqrt(1 - u * u)), np.full(u.size, 0.55)))
         f = np.clip((H - hy) / (H - b0), 0, 1)
         n = t["tiers"]
         tier = f * n
@@ -367,9 +416,11 @@ class Scene:
         w = np.maximum(w, np.maximum(0.12, 0.45 * px) * (hy < H))
         foliage = (np.abs(dx) < w) & (hy >= b0 - 0.3 * sfr) & (hy <= H)
         u = dx / np.maximum(w, 1e-6)
-        bright = 0.55 - 0.32 * u + 0.25 * (1 - sfr) - 0.3 * sfr ** 3 + 0.12 * (1 - f)
-        bright += detail * 0.22 * (h1 - 0.5)
-        put(c, foliage, d, ramp(np.clip(bright, 0, 1.0), NEEDLE_STOPS, NEEDLE_COLS))
+        rest = 0.25 * (1 - sfr) - 0.3 * sfr ** 3 + 0.12 * (1 - f) + detail * 0.22 * (h1 - 0.5)
+        bright = 0.55 - 0.32 * u + rest
+        uc = np.clip(u, -1, 1)
+        lit = self._lit(t, NEEDLE_LIT, (0.9 * uc, np.full(uc.size, 0.4), 0.9 * np.sqrt(1 - uc * uc)), rest - 0.05)
+        put(c, foliage, d, ramp(np.clip(bright, 0, 1.0), NEEDLE_STOPS, NEEDLE_COLS), lit=lit)
 
     def _oct(self, x, y, foot, wl, seed, sx=1.0, sy=1.0):
         w = smoothstep(1.2, 3.5, wl / foot)
@@ -393,14 +444,6 @@ class Scene:
         col = MEADOW * (1 - dry) + MEADOW_DRY * dry
         col = col * (0.82 + 0.18 * smoothstep(2.0, 40.0, np.hypot(x, y)))[:, None]
 
-        for t in self.trees:
-            if t["D"] > 120:
-                continue
-            ra = math.radians(t["az"])
-            rad = t["r"] * (1.25 if t["kind"] == "leaf" else 1.4)
-            dist = np.hypot(x - t["D"] * math.sin(ra) - rad * 0.35, (y - t["D"] * math.cos(ra)) * 1.2)
-            col = col * (1 - 0.35 * inside(rad - dist))
-
         k = 0.55 * (y - 6.0)
         area = np.minimum(y - 6.0, np.minimum(x + 140.0 + k, 260.0 + k - x) / math.hypot(1.0, 0.55))
         m = inside(area)
@@ -418,6 +461,83 @@ class Scene:
             road = inside(np.minimum(half - a, np.minimum(al + 4, self.road_len - al)), f)
             col[near] = col[near] * (1 - road) + ROAD * road
         return col
+
+    def _caster(self, t):
+        """Тело дерева для теней: шары кроны и вертикальные цилиндры ствола и ярусов ели."""
+        ra = math.radians(t["az"])
+        bx, by = t["D"] * math.sin(ra), t["D"] * math.cos(ra)
+        right, back = np.array([math.cos(ra), -math.sin(ra)]), np.array([-math.sin(ra), -math.cos(ra)])
+        cyl = [(t["tw"] / 2, 0.0, (t["hc"] - 0.45 * t["r"]) if t["kind"] == "leaf" else t["h"] * 0.85)]
+        if t["kind"] == "leaf":
+            cx, cy, cr, cz = t["clumps"]
+            xy = np.array([bx, by]) + cx[:, None] * right + cz[:, None] * back
+            spheres = np.column_stack([xy, t["hc"] + cy, cr * 0.95])
+            top = t["hc"] + t["r"]
+        else:
+            spheres = np.zeros((0, 4))
+            H, b0, R = t["h"], t["b"], t["r"]
+            edges = np.linspace(b0, H, 9)
+            for z0, z1 in zip(edges[:-1], edges[1:]):
+                f = (H - (z0 + z1) / 2) / (H - b0)
+                cyl.append((R * f ** 0.9 * 0.8, z0, z1))
+            top = H
+        return {"x": bx, "y": by, "spheres": spheres, "cyl": np.array(cyl), "top": top,
+                "reach": max([t["r"] * 1.3] + [c[0] for c in cyl])}
+
+    def lit(self, geo, sun, sun_alt):
+        """Базовые цвета кадра: листва, хвоя и кора освещены текущим Солнцем, на землю легли тени деревьев."""
+        base = geo.base.copy()
+        w = float(smoothstep(-6.0, 2.0, sun_alt))
+        s = np.array([sun[0], sun[1], max(sun[2], 0.05)])
+        light = w * s / np.linalg.norm(s) + (1 - w) * np.array([0.0, 0.0, 1.0])
+        light /= np.linalg.norm(light)
+        idx = np.nonzero(geo.lid)[0]
+        if idx.size:
+            k, a, m = geo.lid[idx], geo.la[idx], geo.lm[idx]
+            nl, gl = geo.ln[idx] @ light, geo.lg[idx] @ light
+            wrap = np.clip((nl + 0.4) / 1.4, 0, 1)
+            glow = 0.16 * np.clip(-gl, 0, 1) * (1.6 - m)
+            b = np.where(k == LEAF_LIT, a + m * (0.55 * wrap + 0.19 * gl) + glow,
+                         np.where(k == NEEDLE_LIT, a + 0.7 * (0.5 + 0.5 * nl), a + 0.4 * np.clip(nl, 0, 1)))
+            col = np.where((k == LEAF_LIT)[:, None], ramp(np.clip(b, 0, 1.05), LEAF_STOPS, LEAF_COLS),
+                           np.where((k == NEEDLE_LIT)[:, None], ramp(np.clip(b, 0, 1.0), NEEDLE_STOPS, NEEDLE_COLS),
+                                    TRUNK * b[:, None]))
+            base[idx] = col
+        strength = 0.42 * float(smoothstep(0.0, 6.0, sun_alt))
+        gi, gx, gy, gf = geo.ground
+        if strength > 0 and gi.size:
+            self._shadows(base, gi, gx, gy, gf, sun, strength)
+        return base
+
+    def _shadows(self, base, gi, gx, gy, gf, sun, strength):
+        sz = max(sun[2], math.sin(math.radians(2.0)))
+        hlen = math.hypot(sun[0], sun[1])
+        sh = np.array([sun[0], sun[1]]) / max(hlen, 1e-9)
+        slope = sz / max(hlen, 1e-9)
+        sin_alt = sz / math.hypot(hlen, sz)
+        for c in self.casters:
+            pad = c["reach"] + 1.0
+            rx, ry = gx - c["x"], gy - c["y"]
+            run = -(rx * sh[0] + ry * sh[1])
+            box = np.nonzero((run > -pad) & (run < c["top"] / slope + pad) & (np.abs(rx * sh[1] - ry * sh[0]) < pad))[0]
+            if not box.size:
+                continue
+            px, py = gx[box], gy[box]
+            qx, qy = c["x"] - px, c["y"] - py
+            along = qx * sh[0] + qy * sh[1]
+            perp = np.abs(qx * sh[1] - qy * sh[0])
+            z = along * slope
+            gap = np.full(box.size, np.inf)
+            for r, z0, z1 in c["cyl"]:
+                np.minimum(gap, np.where((along > 0) & (z >= z0) & (z <= z1), perp - r, np.inf), out=gap)
+            for cx, cy, cz, r in c["spheres"]:
+                ex, ey = px - cx + cz / slope * sh[0], py - cy + cz / slope * sh[1]
+                u = (ex * sh[0] + ey * sh[1]) * sin_alt
+                w = ex * sh[1] - ey * sh[0]
+                np.minimum(gap, np.sqrt(u * u + w * w) - r, out=gap)
+            shade = smoothstep(-1.0, 1.0, -gap / (gf[box] * 0.5 + 0.03))
+            sel = gi[box]
+            base[sel] *= (1 - strength * shade)[:, None]
 
     def window_lights(self):
         out = []

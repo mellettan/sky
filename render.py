@@ -235,7 +235,9 @@ class Renderer:
             if key != self._geo_key:
                 self._geo = self.scene.geometry(az, alt, math.radians(cam.px_deg()) * 2, cols)
                 self._geo_key = key
-            base, depth, kind, wid = self._geo
+            geo = self._geo
+            depth, kind, wid = geo.depth, geo.kind, geo.wid
+            base = self.scene.lit(geo, snap.sun.vec, sun_alt)
             land = np.isfinite(depth)
             if land.any():
                 hv = np.stack([np.sin(np.radians(az[land])), np.cos(np.radians(az[land])),
