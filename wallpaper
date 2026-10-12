@@ -2,5 +2,5 @@
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 pkill -f -- "--class=sky-wallpaper" 2>/dev/null
 exec kitty +kitten panel --edge=background --class=sky-wallpaper \
-    -o background_opacity=1 -o window_padding_width=0 -o font_size=9 \
+    -o background_opacity=1 -o window_padding_width=0 -o font_size=9 -o clear_all_mouse_actions=yes \
     "$DIR/sky" --wallpaper --az 205 --alt 0 --fov 120 --bortle 7 "$@"
