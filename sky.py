@@ -18,6 +18,7 @@ import numpy as np
 import astro
 import names
 import render
+import satellites
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "config.json"
@@ -41,6 +42,8 @@ LABEL_PLANET = (228, 196, 136)
 LABEL_LUM = (222, 222, 210)
 LABEL_COMET = (140, 196, 236)
 LABEL_CON = (92, 128, 196)
+LABEL_SAT = (196, 220, 255)
+COMPASS = ["С", "ССВ", "СВ", "ВСВ", "В", "ВЮВ", "ЮВ", "ЮЮВ", "Ю", "ЮЮЗ", "ЮЗ", "ЗЮЗ", "З", "ЗСЗ", "СЗ", "ССЗ"]
 LABEL_MAX = 300
 
 HELP = [
@@ -325,6 +328,9 @@ class App:
         self.cfg = load_config()
         self.cat = astro.StarCatalog()
         self.comets = astro.load_comets()
+        self.sats = satellites.Satellites()
+        self.tle_check = 0.0
+        self.passes = {}
         self.cons = astro.Constellations(self.cat)
         self.star_index = self.build_star_index()
         self.renderer = render.Renderer(self.cat, self.cons)
@@ -401,8 +407,9 @@ class App:
         save_config(self.cfg)
 
     def frame_interval(self):
+        moving = not self.paused and self.sat_on_screen()
         if self.wall:
-            return self.wall.interval
+            return min(self.wall.interval, 0.5) if moving else self.wall.interval
         if self.paused:
             return 5.0
         cam_px = self.view.fov / max(self.size[0] * 2, 1)
@@ -410,10 +417,26 @@ class App:
         interval = float(np.clip(cam_px / max(rate, 1e-9) * 1.5, 0.04, 1.0))
         if abs(self.speed) > 1:
             interval = min(interval, 0.08)
+        if moving:
+            interval = min(interval, 0.15)
         return max(interval, self.render_cost * 1.15)
+
+    def sat_on_screen(self):
+        if self.frame is None:
+            return False
+        w, h = self.size[0] * 2, self.size[1] * 4
+        return any(b.kind == "sat" and vis and 0 <= bx < w and 0 <= by < h for b, bx, by, _, _, vis in self.frame.bodies)
+
+    def set_sats(self, sats):
+        self.sats = sats
+        self.passes = {}
+        self.dirty = "full"
 
     def run(self):
         while self.running:
+            if time.time() > self.tle_check:
+                self.tle_check = time.time() + 3600
+                satellites.refresh_async(self.set_sats)
             size = self.term.size()
             if size != self.size:
                 self.size = size
@@ -434,7 +457,7 @@ class App:
     def snapshot(self):
         jd = self.jd()
         self.snap = astro.compute_snapshot(jd, math.radians(self.lat), math.radians(self.lon), self.comets,
-                                           self.view.atmosphere)
+                                           self.view.atmosphere, self.sats)
         return self.snap
 
     def draw(self, full=True):
@@ -572,6 +595,9 @@ class App:
                 items.append((-100.0, b.key, bx, by, r, b.name, LABEL_LUM))
             elif b.kind == "planet":
                 items.append((mag - 50.0, b.key, bx, by, r, b.name, LABEL_PLANET))
+            elif b.kind == "sat":
+                if b.extra["norad"] in satellites.NAMES:
+                    items.append((mag - 40.0, b.key, bx, by, r, b.name, LABEL_SAT))
             else:
                 items.append((mag - 30.0, b.key, bx, by, r, b.name, LABEL_COMET))
         if f.star_x.size:
@@ -678,8 +704,33 @@ class App:
             return ["Луна", ecl, f"Освещена на {b.phase * 100:.0f}%, {phase} · {km:,.0f} км".replace(",", " "), where]
         if b.kind == "planet":
             return [b.name, f"блеск {b.mag:.1f} · {b.dist_au:.2f} а.е. от Земли", where]
+        if b.kind == "sat":
+            x = b.extra
+            seen = "в тени Земли" if x["light"] < 0.01 else f"блеск {b.mag:.1f}"
+            title = b.name if b.name == x["des"] else f"{b.name} · {x['des']}"
+            return [title, f"орбита {x['height']:.0f} км · дальность {x['range']:.0f} км · {seen}",
+                    self.pass_text(x["index"], x["norad"]), where]
         return [b.name, f"{b.extra['des']} · блеск {b.mag:.1f}",
                 f"{b.extra['r']:.2f} а.е. от Солнца · {b.dist_au:.2f} а.е. от Земли", where]
+
+    def pass_text(self, i, norad):
+        jd = self.snap.jd
+        key = (norad, self.lat, self.lon)
+        at, p = self.passes.get(key, (None, None))
+        if at is None or jd < at or jd > (p["end"] if p else at + 0.1):
+            p = self.sats.next_pass(i, jd, math.radians(self.lat), math.radians(self.lon))
+            self.passes[key] = (jd, p)
+        if p is None:
+            return "Видимых пролётов в ближайшие двое суток нет"
+        start = astro.datetime_from_jd(p["start"]).astimezone(LOCAL_TZ)
+        end = astro.datetime_from_jd(p["end"]).astimezone(LOCAL_TZ)
+        if p["start"] <= jd:
+            return f"Виден до {end:%H:%M}, уходит на {compass(p['az_end'])}"
+        path = f"с {compass(p['az_start'])} на {compass(p['az_end'])}, до {p['max_alt']:.0f}°, блеск {p['mag']:.1f}"
+        today = astro.datetime_from_jd(jd).astimezone(LOCAL_TZ).date()
+        days = (start.date() - today).days
+        day = {0: "сегодня", 1: "завтра", 2: "послезавтра"}.get(days, start.strftime("%d.%m"))
+        return f"Пролёт {day} {start:%H:%M}–{end:%H:%M}, {path}"
 
     @staticmethod
     def lunar_text(sh):
@@ -1062,6 +1113,10 @@ class App:
             if ru.startswith(q) or latin.startswith(q):
                 return f"con:{code}"
         return None
+
+
+def compass(az):
+    return COMPASS[int((az % 360.0) / 22.5 + 0.5) % 16]
 
 
 def parse_args():

@@ -385,7 +385,7 @@ class Snapshot:
     lunar: Shadow | None = None
 
 
-def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
+def compute_snapshot(jd_ut, lat, lon, comets, refraction=True, sats=None):
     jd = jd_ut + delta_t(jd_ut) / 86400.0
     lst = gmst(jd_ut) + lon
     prec = precession_matrix(jd)
@@ -465,6 +465,10 @@ def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
         b = make(c["des"], c["name"], "comet", geo, mag, (200, 255, 225), 0.0,
                  {"des": c["des"], "r": r, "tails": tails})
         bodies.append(b)
+
+    if sats is not None and len(sats):
+        sun_date = prec @ (sun_geo / np.linalg.norm(sun_geo))
+        bodies.extend(sats.bodies(jd_ut, lat, lst, prec, sun_date, apparent))
 
     cov, total = eclipse(sun, moon)
     return Snapshot(jd_ut, lat, lon, lst, hor, sun, moon, bodies, cov, total, lunar)

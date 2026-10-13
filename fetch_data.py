@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+import satellites
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 RAW = DATA / "raw"
@@ -200,15 +202,22 @@ def build_constellations():
     print(f"Созвездий: {len(out)}")
 
 
+def build_satellites():
+    satellites.download()
+    print(f"Спутников: {len(satellites.Satellites())}")
+
+
 def main():
     DATA.mkdir(exist_ok=True)
-    what = sys.argv[1:] or ["stars", "comets", "constellations"]
+    what = sys.argv[1:] or ["stars", "comets", "constellations", "satellites"]
     if "stars" in what:
         build_stars()
     if "comets" in what:
         build_comets()
     if "constellations" in what:
         build_constellations()
+    if "satellites" in what:
+        build_satellites()
 
 
 if __name__ == "__main__":
