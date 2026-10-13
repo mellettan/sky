@@ -40,6 +40,7 @@ LABEL_STAR = (138, 152, 190)
 LABEL_PLANET = (228, 196, 136)
 LABEL_LUM = (222, 222, 210)
 LABEL_COMET = (140, 196, 236)
+LABEL_CON = (92, 128, 196)
 LABEL_MAX = 300
 
 HELP = [
@@ -52,6 +53,7 @@ HELP = [
     "g              ландшафт вкл/выкл",
     "a              атмосфера вкл/выкл",
     "l              подписи вкл/выкл",
+    "k              созвездия вкл/выкл",
     "[ ] или 1..9   засветка (шкала Бортля)",
     "Пробел         пауза / ход времени",
     ", .            медленнее / быстрее (можно назад)",
@@ -60,7 +62,7 @@ HELP = [
     "n              сейчас",
     "t              ввести дату и время",
     "c              ввести координаты или город",
-    "/              найти объект (Юпитер, Вега, Галлея…)",
+    "/              найти объект (Юпитер, Вега, Орион…)",
     "f              следить за выбранным объектом",
     "Esc            снять выбор / закрыть",
     "? или h        эта справка,  q — выход",
@@ -69,7 +71,7 @@ HELP = [
 
 def load_config():
     cfg = {"lat": 55.7558, "lon": 37.6173, "place": "Москва", "bortle": 5, "landscape": True, "atmosphere": True,
-           "labels": True}
+           "labels": True, "constellations": False}
     try:
         cfg.update(json.loads(CONFIG.read_text()))
     except (OSError, ValueError):
@@ -301,9 +303,12 @@ class App:
         self.cfg = load_config()
         self.cat = astro.StarCatalog()
         self.comets = astro.load_comets()
-        self.renderer = render.Renderer(self.cat)
+        self.cons = astro.Constellations(self.cat)
+        self.star_index = self.build_star_index()
+        self.renderer = render.Renderer(self.cat, self.cons)
         self.view = render.View(bortle=int(self.cfg["bortle"]), landscape=bool(self.cfg["landscape"]),
-                                atmosphere=bool(self.cfg["atmosphere"]), labels=bool(self.cfg["labels"]))
+                                atmosphere=bool(self.cfg["atmosphere"]), labels=bool(self.cfg["labels"]),
+                                constellations=bool(self.cfg["constellations"]) and len(self.cons) > 0)
         self.lat = float(self.cfg["lat"])
         self.lon = float(self.cfg["lon"])
         self.place = self.cfg["place"]
@@ -330,6 +335,7 @@ class App:
             v.az, v.alt, v.fov, v.bortle = wall.az % 360, wall.alt, wall.fov, wall.bortle
             v.labels = not wall.no_labels
             v.landscape = not wall.no_landscape
+            v.constellations = wall.constellations and len(self.cons) > 0
             v.shift = 0.5 - wall.horizon
             if wall.place:
                 self.lat, self.lon, self.place = parse_coords(wall.place)
@@ -368,7 +374,7 @@ class App:
             return
         self.cfg.update({"lat": self.lat, "lon": self.lon, "place": self.place, "bortle": self.view.bortle,
                          "landscape": self.view.landscape, "atmosphere": self.view.atmosphere,
-                         "labels": self.view.labels})
+                         "labels": self.view.labels, "constellations": self.view.constellations})
         save_config(self.cfg)
 
     def frame_interval(self):
@@ -403,7 +409,8 @@ class App:
 
     def snapshot(self):
         jd = self.jd()
-        self.snap = astro.compute_snapshot(jd, math.radians(self.lat), math.radians(self.lon), self.comets)
+        self.snap = astro.compute_snapshot(jd, math.radians(self.lat), math.radians(self.lon), self.comets,
+                                           self.view.atmosphere)
         return self.snap
 
     def draw(self, full=True):
@@ -444,9 +451,11 @@ class App:
             self.render_cost = time.time() - t0
 
     def object_altaz(self, key):
-        if key.startswith("star:"):
-            i = int(key[5:])
-            v = self.cat.vectors(self.snap.jd)[i] @ self.snap.hor.T
+        if key.startswith(("star:", "con:")):
+            if key.startswith("star:"):
+                v = self.cat.vectors(self.snap.jd)[int(key[5:])] @ self.snap.hor.T
+            else:
+                v = self.cons.label_vec[self.cons.codes.index(key[4:])] @ self.snap.hor.T
             if self.view.atmosphere:
                 v = astro.refract(v[None, :])[0]
         else:
@@ -560,10 +569,10 @@ class App:
 
     def draw_labels(self, cv, sky_rows):
         f = self.frame
-        if not self.view.labels or f is None:
+        if f is None or not (self.view.labels or self.view.constellations):
             return
         cols = cv.cols
-        items = self.label_items(f, sky_rows, cols)
+        items = self.label_items(f, sky_rows, cols) if self.view.labels else []
         taken = np.zeros((sky_rows, cols), bool)
         for cx, cy, _, _, _, _ in items:
             taken[cy, cx] = True
@@ -573,24 +582,34 @@ class App:
             n = len(text)
             cands = [(cy, cx + half + 1), (cy, cx - half - n), (cy - vr, cx - n // 2), (cy + vr, cx - n // 2),
                      (cy - vr, cx + 1), (cy + vr, cx + 1), (cy - vr, cx - n), (cy + vr, cx - n)]
-            best, best_cost = None, None
-            for k, (y, x) in enumerate(cands):
-                if not (0 <= y < sky_rows and 0 <= x and x + n <= cols):
-                    continue
-                if taken[y, x:x + n].any():
-                    continue
-                cost = int(dotted[y, x:x + n].sum()) + 0.3 * k
-                if best_cost is None or cost < best_cost:
-                    best, best_cost = (y, x), cost
-            if best is None:
+            self.place_label(cv, cands, text, col, taken, dotted, sky_rows)
+        if self.view.constellations:
+            for code, bx, by in f.con_labels:
+                text = names.CONSTELLATIONS.get(code, code)
+                cx, cy, n = int(bx // 2), int(by // 4), len(text)
+                cands = [(cy, cx - n // 2), (cy - 1, cx - n // 2), (cy + 1, cx - n // 2)]
+                self.place_label(cv, cands, text, LABEL_CON, taken, dotted, sky_rows)
+
+    def place_label(self, cv, cands, text, col, taken, dotted, sky_rows):
+        n = len(text)
+        best, best_cost = None, None
+        for k, (y, x) in enumerate(cands):
+            if not (0 <= y < sky_rows and 0 <= x and x + n <= cv.cols):
                 continue
-            y, x = best
-            lo, hi = max(x - 1, 0), min(x + n + 1, cols)
-            taken[y, lo:hi] = True
-            half_block = chars[y, x:x + n] == 0x2580
-            mixed = (cv.fg[y, x:x + n].astype(np.int32) + cv.bg[y, x:x + n]) // 2
-            cv.bg[y, x:x + n][half_block] = mixed[half_block]
-            cv.put(y, x, text, col)
+            if taken[y, x:x + n].any():
+                continue
+            cost = int(dotted[y, x:x + n].sum()) + 0.3 * k
+            if best_cost is None or cost < best_cost:
+                best, best_cost = (y, x), cost
+        if best is None:
+            return
+        y, x = best
+        lo, hi = max(x - 1, 0), min(x + n + 1, cv.cols)
+        taken[y, lo:hi] = True
+        half_block = cv.chars[y, x:x + n] == 0x2580
+        mixed = (cv.fg[y, x:x + n].astype(np.int32) + cv.bg[y, x:x + n]) // 2
+        cv.bg[y, x:x + n][half_block] = mixed[half_block]
+        cv.put(y, x, text, col)
 
     def describe(self, key):
         snap = self.snap
@@ -855,6 +874,13 @@ class App:
             v.labels = not v.labels
             self.save()
             self.dirty = True
+        elif c in "kл":
+            if not len(self.cons):
+                self.notify("Нет данных о созвездиях: .venv/bin/python fetch_data.py constellations")
+                return
+            v.constellations = not v.constellations
+            self.save()
+            self.dirty = "full"
         elif c in "[х":
             self.set_bortle(v.bortle - 1)
         elif c in "]ъ":
@@ -930,6 +956,9 @@ class App:
             key = self.search(text)
             if key is None:
                 raise ValueError(f"не нашёл «{text}»")
+            if key.startswith("con:"):
+                self.show_constellation(key)
+                return
             self.view.selected = key
             self.follow = True
             pos = self.object_altaz(key)
@@ -938,6 +967,27 @@ class App:
                 if pos[1] < -2:
                     self.notify(f"{self.describe(key)[0]} сейчас под горизонтом (g — убрать землю)")
             self.dirty = "full"
+
+    def show_constellation(self, key):
+        self.view.selected = None
+        self.follow = False
+        if not self.view.constellations:
+            self.view.constellations = True
+            self.save()
+        self.view.az, self.view.alt = self.object_altaz(key)
+        name = names.CONSTELLATIONS.get(key[4:], key[4:])
+        if self.view.alt < -2:
+            self.notify(f"{name} сейчас под горизонтом (g — убрать землю)")
+        else:
+            self.notify(f"Созвездие {name}")
+        self.dirty = "full"
+
+    def build_star_index(self):
+        out = []
+        for i, p in enumerate(self.cat.proper.tolist()):
+            if p:
+                out.append((i, p, p.lower(), names.STARS_RU.get(p, "").lower()))
+        return out
 
     def search(self, text):
         q = text.strip().lower()
@@ -956,20 +1006,22 @@ class App:
                     cands.append((0, len(w), b.key))
         if cands:
             return min(cands)[2]
-        proper = self.cat.proper
-        en_by_ru = {v.lower(): k for k, v in names.STARS_RU.items()}
-        target = en_by_ru.get(q)
-        for i in range(min(len(proper), 20000)):
-            p = str(proper[i])
-            if not p:
-                continue
-            pl = p.lower()
-            ru = names.STARS_RU.get(p, "").lower()
-            if (target and p == target) or pl == q or ru == q:
+        cons = [(code, names.CONSTELLATIONS.get(code, "").lower(), self.cons.latin[code].lower())
+                for code in dict.fromkeys(self.cons.codes)]
+        for code, ru, latin in cons:
+            if q in (ru, latin, code.lower()):
+                return f"con:{code}"
+        for i, p, pl, ru in self.star_index:
+            if pl == q or ru == q:
                 return f"star:{i}"
             if ru.startswith(q) or pl.startswith(q):
                 cands.append((1, i, f"star:{i}"))
-        return min(cands)[2] if cands else None
+        if cands:
+            return min(cands)[2]
+        for code, ru, latin in cons:
+            if ru.startswith(q) or latin.startswith(q):
+                return f"con:{code}"
+        return None
 
 
 def parse_args():
@@ -985,6 +1037,7 @@ def parse_args():
                     help="на какой доле высоты экрана от низа стоит центр взгляда (0.33 — горизонт на трети при --alt 0)")
     ap.add_argument("--no-labels", action="store_true", help="без подписей")
     ap.add_argument("--no-landscape", action="store_true", help="без ландшафта")
+    ap.add_argument("--constellations", action="store_true", help="линии и названия созвездий")
     args = ap.parse_args()
     if args.wallpaper:
         args.fov = min(max(args.fov, 0.05), 200.0)

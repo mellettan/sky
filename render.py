@@ -30,6 +30,7 @@ CARD_COL = np.array([214, 92, 70], float)
 ECL_ZENITH = np.array([14, 20, 46], float)
 ECL_HORIZON = np.array([196, 124, 70], float)
 CORONA = np.array([236, 240, 255], float)
+CON_LINE = np.array([62, 92, 156], float)
 
 BRAILLE_BITS = np.array([[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]], np.int32)
 PLUS = [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -81,6 +82,7 @@ class View:
     landscape: bool = True
     atmosphere: bool = True
     labels: bool = True
+    constellations: bool = False
     shift: float = 0.5 - 1 / 3
     bortle: int = 4
     selected: str | None = None
@@ -98,6 +100,7 @@ class Frame:
     star_idx: np.ndarray
     star_mag: np.ndarray
     bodies: list = field(default_factory=list)
+    con_labels: list = field(default_factory=list)
 
 
 @dataclass
@@ -184,8 +187,9 @@ def sizes_for(mag):
 
 
 class Renderer:
-    def __init__(self, catalog):
+    def __init__(self, catalog, constellations=None):
         self.cat = catalog
+        self.con = constellations
         self.scene = Scene()
         self._geo_key = None
         self._geo = None
@@ -258,6 +262,9 @@ class Renderer:
         cell_pri = np.full((rows, cols), -1.0)
         self._solid = np.zeros((rows, cols), bool)
 
+        cons = []
+        if view.constellations and self.con:
+            cons = self._constellations(view, snap, cam, land, half, dots, cell_col, cell_pri, rows, cols)
         sx, sy, sidx, smag = self._stars(view, snap, cam, lim, land, half, dots, cell_col, cell_pri, rows, cols)
         bodies = self._bodies(view, snap, cam, lim, land, half, dots, cell_col, cell_pri, rows, cols)
 
@@ -271,7 +278,7 @@ class Renderer:
         bg = np.where(braille_cell[..., None], (top + bot) / 2, bot)
         fg = np.clip(fg, 0, 255).astype(np.uint8)
         bg = np.clip(bg, 0, 255).astype(np.uint8)
-        frame = Frame(chars, fg, bg, cam, lim, sx, sy, sidx, smag, bodies)
+        frame = Frame(chars, fg, bg, cam, lim, sx, sy, sidx, smag, bodies, cons)
         self._cardinals(frame, view, rows, cols)
         return frame
 
@@ -321,7 +328,7 @@ class Renderer:
             return empty
         vec = self.cat.vectors(snap.jd)[:n] @ snap.hor.T
         if view.atmosphere:
-            near = vec[:, 2] < 0.2
+            near = vec @ cam.f > math.cos(self._reach(view))
             vec[near] = astro.refract(vec[near])
         mag = self.cat.mag[:n].astype(float)
         alt = np.arcsin(np.clip(vec[:, 2], -1, 1))
@@ -355,6 +362,81 @@ class Renderer:
                 self._plot(ix[sel] + ox, iy[sel] + oy, col[sel], inten[sel] - 0.05 * (ox != 0 or oy != 0),
                            land, dots, cell_col, cell_pri, rows, cols)
         return bx, by, idx, m
+
+    @staticmethod
+    def _reach(view):
+        return math.radians(min(view.fov * 0.75 + 2.0, 179.0))
+
+    def _constellations(self, view, snap, cam, land, half, dots, cell_col, cell_pri, rows, cols):
+        seg = self.con.seg
+        vec = self.cat.vectors(snap.jd)
+        a, b = vec[seg[:, 0]] @ snap.hor.T, vec[seg[:, 1]] @ snap.hor.T
+        if view.atmosphere:
+            a, b = astro.refract(a), astro.refract(b)
+        cosab = np.clip((a * b).sum(axis=1), -1, 1)
+        theta = np.arccos(cosab)
+        e = b - a * cosab[:, None]
+        e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
+        fa, fe = a @ cam.f, e @ cam.f
+        reach = self._reach(view)
+        if reach > math.pi / 3:
+            lo, hi = np.zeros_like(theta), theta
+        else:
+            w = np.arccos(np.clip(math.cos(reach) / np.maximum(np.hypot(fa, fe), 1e-12), -1, 1))
+            phi = np.arctan2(fe, fa)
+            lo, hi = np.clip(phi - w, 0, theta), np.clip(phi + w, 0, theta)
+        keep = np.nonzero(hi > lo)[0]
+        out = self._con_labels(view, snap, cam, land, rows, cols)
+        if not keep.size:
+            return out
+        a, b, e, lo, hi = a[keep], b[keep], e[keep], lo[keep], hi[keep]
+        ax, ay, _ = cam.project(a)
+        ex, ey, _ = cam.project(b)
+        step = math.radians(view.fov) / 80.0
+        k = np.ceil((hi - lo) / step).astype(int) + 1
+        sid = np.repeat(np.arange(keep.size), k)
+        first = np.cumsum(k) - k
+        frac = (np.arange(sid.size) - first[sid]) / (k[sid] - 1)
+        ang = lo[sid] + frac * (hi - lo)[sid]
+        pts = np.cos(ang)[:, None] * a[sid] + np.sin(ang)[:, None] * e[sid]
+        px, py, zc = cam.project(pts)
+        nxt = np.nonzero(sid[1:] == sid[:-1])[0]
+        x0, y0, x1, y1, cs = px[nxt], py[nxt], px[nxt + 1], py[nxt + 1], sid[nxt]
+        pw, ph = cols * 2, rows * 4
+        ok = (zc[nxt] > -0.6) & (zc[nxt + 1] > -0.6)
+        ok &= ~((x0 < 0) & (x1 < 0) | (x0 >= pw) & (x1 >= pw) | (y0 < 0) & (y1 < 0) | (y0 >= ph) & (y1 >= ph))
+        x0, y0, x1, y1, cs = x0[ok], y0[ok], x1[ok], y1[ok], cs[ok]
+        if not x0.size:
+            return out
+        n = np.minimum(np.ceil(np.maximum(np.abs(x1 - x0), np.abs(y1 - y0))).astype(int) + 1, 4000)
+        cid = np.repeat(np.arange(n.size), n)
+        t = (np.arange(cid.size) - (np.cumsum(n) - n)[cid]) / np.maximum(n[cid] - 1, 1)
+        lx = x0[cid] + (x1 - x0)[cid] * t
+        ly = y0[cid] + (y1 - y0)[cid] * t
+        s = cs[cid]
+        gap = np.minimum(4.5, 0.25 * np.hypot(ex - ax, ey - ay))[s]
+        ok = (np.hypot(lx - ax[s], ly - ay[s]) > gap) & (np.hypot(lx - ex[s], ly - ey[s]) > gap)
+        ok &= (lx >= 0) & (lx < pw) & (ly >= 0) & (ly < ph)
+        ix, iy = np.floor(lx[ok]).astype(int), np.floor(ly[ok]).astype(int)
+        if ix.size:
+            bgc = half[iy // 2, ix // 2]
+            col = bgc + (CON_LINE - bgc) * 0.8
+            self._plot(ix, iy, col, np.full(ix.size, -0.5), land, dots, cell_col, cell_pri, rows, cols)
+        return out
+
+    def _con_labels(self, view, snap, cam, land, rows, cols):
+        v = self.con.label_vec @ snap.hor.T
+        if view.atmosphere:
+            v = astro.refract(v)
+        bx, by, zc = cam.project(v)
+        out = []
+        for code, x, y, z in zip(self.con.codes, bx, by, zc):
+            if z < 0 or not (0 <= x < cols * 2 and 0 <= y < rows * 4):
+                continue
+            if land[int(y) // 2, int(x) // 2]:
+                continue
+            out.append((code, float(x), float(y)))
+        return out
 
     def _bodies(self, view, snap, cam, lim, land, half, dots, cell_col, cell_pri, rows, cols):
         out = []

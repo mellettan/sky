@@ -370,7 +370,7 @@ class Snapshot:
     total: bool = False
 
 
-def compute_snapshot(jd_ut, lat, lon, comets):
+def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
     jd = jd_ut + delta_t(jd_ut) / 86400.0
     lst = gmst(jd_ut) + lon
     prec = precession_matrix(jd)
@@ -380,10 +380,13 @@ def compute_snapshot(jd_ut, lat, lon, comets):
     obs = prec.T @ obs_date
     sun_geo = -planet_helio("Земля", jd - LIGHT_DAY_PER_AU * float(np.linalg.norm(earth))) - obs
 
+    def apparent(u):
+        v = hor @ u
+        return refract(v[None, :])[0] if refraction else v
+
     def make(key, name, kind, geo, mag, color, radius_km, extra=None):
         dist = float(np.linalg.norm(geo))
-        u = geo / dist
-        v = refract((hor @ u)[None, :])[0]
+        v = apparent(geo / dist)
         to_sun = sun_geo - geo
         n = float(np.linalg.norm(to_sun))
         if n < 1e-9:
@@ -441,7 +444,7 @@ def compute_snapshot(jd_ut, lat, lon, comets):
             dust = geo + p / r * tail_len * 0.75 - vel * tail_len * 0.35
             for end, kind in ((dust, "dust"), (ion, "ion")):
                 t = end / np.linalg.norm(end)
-                tails.append((refract((hor @ t)[None, :])[0], kind))
+                tails.append((apparent(t), kind))
         b = make(c["des"], c["name"], "comet", geo, mag, (200, 255, 225), 0.0,
                  {"des": c["des"], "r": r, "tails": tails})
         bodies.append(b)
@@ -515,3 +518,41 @@ class StarCatalog:
 
     def count_brighter(self, mag):
         return int(np.searchsorted(self.mag, mag, side="right"))
+
+
+class Constellations:
+    def __init__(self, catalog):
+        self.seg = np.zeros((0, 2), int)
+        self.codes = []
+        self.label_vec = np.zeros((0, 3))
+        self.latin = {}
+        p = DATA / "constellations.json"
+        if not p.exists():
+            return
+        data = json.loads(p.read_text())
+        want = {str(h) for c in data for line in c["lines"] for h in line}
+        index = {h: i for i, h in enumerate(catalog.hip.tolist()) if h in want}
+        seg, vecs = set(), []
+        for c in data:
+            con = c["con"]
+            self.latin[con] = c["name"]
+            stars = set()
+            for line in c["lines"]:
+                for a, b in zip(line, line[1:]):
+                    a, b = index.get(str(a)), index.get(str(b))
+                    if a is not None and b is not None and a != b:
+                        seg.add((min(a, b), max(a, b)))
+                        stars.update((a, b))
+            if c.get("labels"):
+                for ra, dec in c["labels"]:
+                    vecs.append(radec_to_vec(math.radians(ra * 15.0), math.radians(dec)))
+                    self.codes.append(con)
+            elif stars:
+                v = catalog.base[sorted(stars)].sum(axis=0)
+                vecs.append(v / np.linalg.norm(v))
+                self.codes.append(con)
+        self.seg = np.array(sorted(seg), int).reshape(-1, 2)
+        self.label_vec = np.array(vecs).reshape(-1, 3)
+
+    def __len__(self):
+        return len(self.seg)

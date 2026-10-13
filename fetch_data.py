@@ -15,6 +15,7 @@ RAW = DATA / "raw"
 HYG_URL = "https://raw.githubusercontent.com/astronexus/HYG-Database/main/hyg/CURRENT/hygdata_v41.csv"
 SBDB_URL = "https://ssd-api.jpl.nasa.gov/sbdb.api"
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
+SKYCULTURE_URL = "https://raw.githubusercontent.com/Stellarium/stellarium/v25.3/skycultures/modern/index.json"
 MAG_LIMIT = 11.0
 
 COMETS = [
@@ -185,13 +186,29 @@ def build_comets():
     print(f"Комет: {len(out)}")
 
 
+def build_constellations():
+    src = RAW / "skyculture_modern.json"
+    if not src.exists():
+        download(SKYCULTURE_URL, src)
+    out = []
+    for c in json.loads(src.read_text())["constellations"]:
+        item = {"con": c["id"].split()[-1], "name": c["common_name"]["native"], "lines": c["lines"]}
+        if c.get("label_positions"):
+            item["labels"] = c["label_positions"]
+        out.append(item)
+    (DATA / "constellations.json").write_text(json.dumps(out, ensure_ascii=False))
+    print(f"Созвездий: {len(out)}")
+
+
 def main():
     DATA.mkdir(exist_ok=True)
-    what = sys.argv[1:] or ["stars", "comets"]
+    what = sys.argv[1:] or ["stars", "comets", "constellations"]
     if "stars" in what:
         build_stars()
     if "comets" in what:
         build_comets()
+    if "constellations" in what:
+        build_constellations()
 
 
 if __name__ == "__main__":
