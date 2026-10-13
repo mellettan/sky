@@ -48,7 +48,7 @@ python3 -m venv .venv && .venv/bin/pip install numpy
 ./wallpaper
 ```
 
-Запускает небо на слое обоев через `kitty +kitten panel --edge=background` (Wayland с wlr-layer-shell: Hyprland, sway). Вид задаётся в самом скрипте `wallpaper` аргументами `sky.py`: `--az 205 --alt 0 --fov 120 --bortle 7`; можно также `--horizon 0.33` (на какой доле высоты экрана от низа стоит центр взгляда; при `--alt 0` горизонт идёт там ровной линией), `--place "сидней"`, `--interval 10`, `--no-labels`, `--no-landscape`, а крупность точек — через `font_size` в скрипте. Место по умолчанию берётся из `config.json`, сам режим обоев ничего в него не пишет. Повторный запуск `./wallpaper` перезапускает обои, остановить — `pkill -f class=sky-wallpaper`.
+Запускает небо на слое обоев через `kitty +kitten panel --edge=background` (Wayland с wlr-layer-shell: Hyprland, sway). Вид задаётся в самом скрипте `wallpaper` аргументами `sky.py`: `--az 205 --alt 0 --fov 120 --bortle 5`; можно также `--horizon 0.33` (на какой доле высоты экрана от низа стоит центр взгляда; при `--alt 0` горизонт идёт там ровной линией), `--place "сидней"`, `--interval 10`, `--no-labels`, `--no-landscape`, а крупность точек — через `font_size` в скрипте. Место по умолчанию берётся из `config.json`, сам режим обоев ничего в него не пишет. Повторный запуск `./wallpaper` перезапускает обои, остановить — `pkill -f class=sky-wallpaper`.
 
 ## Что интересного посмотреть
 

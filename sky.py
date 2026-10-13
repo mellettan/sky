@@ -68,7 +68,7 @@ HELP = [
 
 
 def load_config():
-    cfg = {"lat": 55.7558, "lon": 37.6173, "place": "Москва", "bortle": 4, "landscape": True, "atmosphere": True,
+    cfg = {"lat": 55.7558, "lon": 37.6173, "place": "Москва", "bortle": 5, "landscape": True, "atmosphere": True,
            "labels": True}
     try:
         cfg.update(json.loads(CONFIG.read_text()))
@@ -978,7 +978,7 @@ def parse_args():
     ap.add_argument("--az", type=float, default=180.0, help="азимут центра взгляда, градусы")
     ap.add_argument("--alt", type=float, default=0.0, help="высота центра взгляда, градусы")
     ap.add_argument("--fov", type=float, default=100.0, help="поле зрения по горизонтали, градусы")
-    ap.add_argument("--bortle", type=int, default=4, choices=range(1, 10), help="засветка по шкале Бортля")
+    ap.add_argument("--bortle", type=int, default=5, choices=range(1, 10), help="засветка по шкале Бортля")
     ap.add_argument("--place", help="город или координаты; по умолчанию место из config.json")
     ap.add_argument("--interval", type=float, default=10.0, help="секунд между кадрами")
     ap.add_argument("--horizon", type=float, default=1 / 3,
