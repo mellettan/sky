@@ -240,35 +240,57 @@ class Terminal:
         return ev
 
 
-def to_ansi(chars, fg, bg, avoid=None):
-    rows, cols = chars.shape
-    if avoid is not None:
-        same = (bg == np.array(avoid, np.uint8)).all(axis=-1)
-        bg[same, 2] = avoid[2] - 1 if avoid[2] == 255 else avoid[2] + 1
-    fgp = ((fg[..., 0].astype(np.int32) << 16) | (fg[..., 1].astype(np.int32) << 8) | fg[..., 2]).tolist()
-    bgp = ((bg[..., 0].astype(np.int32) << 16) | (bg[..., 1].astype(np.int32) << 8) | bg[..., 2]).tolist()
-    ch = chars.tolist()
-    out = ["\x1b[?2026h"]
-    for y in range(rows):
-        out.append(f"\x1b[{y + 1};1H")
+class Screen:
+    """Помнит, что уже выведено в терминал, и выводит только изменившиеся ячейки."""
+
+    GAP = 3
+
+    def __init__(self):
+        self.prev = None
+
+    def reset(self):
+        self.prev = None
+
+    def render(self, chars, fg, bg, avoid=None):
+        if avoid is not None:
+            same = (bg == np.array(avoid, np.uint8)).all(axis=-1)
+            bg[same, 2] = avoid[2] - 1 if avoid[2] == 255 else avoid[2] + 1
+        fgp = (fg[..., 0].astype(np.int32) << 16) | (fg[..., 1].astype(np.int32) << 8) | fg[..., 2]
+        bgp = (bg[..., 0].astype(np.int32) << 16) | (bg[..., 1].astype(np.int32) << 8) | bg[..., 2]
+        prev = self.prev
+        if prev is None or prev[0].shape != chars.shape:
+            changed = np.ones(chars.shape, bool)
+        else:
+            changed = (chars != prev[0]) | (fgp != prev[1]) | (bgp != prev[2])
+        self.prev = (chars.copy(), fgp, bgp)
+        rows = np.nonzero(changed.any(axis=1))[0]
+        if not rows.size:
+            return ""
+        out = ["\x1b[?2026h"]
         lf = lb = -1
-        rf, rb, rc = fgp[y], bgp[y], ch[y]
-        for x in range(cols):
-            b = rb[x]
-            if b != lb:
-                out.append(f"\x1b[48;2;{b >> 16};{(b >> 8) & 255};{b & 255}m")
-                lb = b
-            c = rc[x]
-            f = rf[x]
-            if c == 32 or (c == 0x2580 and f == b):
-                out.append(" ")
-                continue
-            if f != lf:
-                out.append(f"\x1b[38;2;{f >> 16};{(f >> 8) & 255};{f & 255}m")
-                lf = f
-            out.append(chr(c))
-    out.append("\x1b[0m\x1b[?2026l")
-    return "".join(out)
+        for y in rows.tolist():
+            xs = np.nonzero(changed[y])[0]
+            cut = np.nonzero(np.diff(xs) > self.GAP + 1)[0]
+            starts, ends = np.r_[xs[0], xs[cut + 1]].tolist(), np.r_[xs[cut], xs[-1]].tolist()
+            rf, rb, rc = fgp[y].tolist(), bgp[y].tolist(), chars[y].tolist()
+            for x0, x1 in zip(starts, ends):
+                out.append(f"\x1b[{y + 1};{x0 + 1}H")
+                for x in range(x0, x1 + 1):
+                    b = rb[x]
+                    if b != lb:
+                        out.append(f"\x1b[48;2;{b >> 16};{(b >> 8) & 255};{b & 255}m")
+                        lb = b
+                    c = rc[x]
+                    f = rf[x]
+                    if c == 32 or (c == 0x2580 and f == b):
+                        out.append(" ")
+                        continue
+                    if f != lf:
+                        out.append(f"\x1b[38;2;{f >> 16};{(f >> 8) & 255};{f & 255}m")
+                        lf = f
+                    out.append(chr(c))
+        out.append("\x1b[0m\x1b[?2026l")
+        return "".join(out)
 
 
 class Canvas:
@@ -330,6 +352,7 @@ class App:
         self.render_cost = 0.0
         self.running = True
         self.size = (0, 0)
+        self.screen = Screen()
         if wall:
             v = self.view
             v.az, v.alt, v.fov, v.bortle = wall.az % 360, wall.alt, wall.fov, wall.bortle
@@ -394,6 +417,7 @@ class App:
             size = self.term.size()
             if size != self.size:
                 self.size = size
+                self.screen.reset()
                 self.dirty = "full"
             now = time.time()
             if self.message and now > self.message[1]:
@@ -438,7 +462,7 @@ class App:
         cv = Canvas(chars, fg, bg)
         self.draw_labels(cv, sky_rows)
         if self.wall:
-            self.term.write(to_ansi(chars, fg, bg, getattr(self.term, "default_bg", None)))
+            self.output(chars, fg, bg)
             self.render_cost = time.time() - t0
             return
         self.draw_marker(cv)
@@ -446,9 +470,14 @@ class App:
         self.draw_status(cv, sky_rows)
         if self.help:
             self.draw_help(cv)
-        self.term.write(to_ansi(chars, fg, bg, getattr(self.term, "default_bg", None)))
+        self.output(chars, fg, bg)
         if full:
             self.render_cost = time.time() - t0
+
+    def output(self, chars, fg, bg):
+        out = self.screen.render(chars, fg, bg, getattr(self.term, "default_bg", None))
+        if out:
+            self.term.write(out)
 
     def object_altaz(self, key):
         if key.startswith(("star:", "con:")):
