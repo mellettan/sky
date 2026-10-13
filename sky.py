@@ -266,34 +266,38 @@ class Screen:
         else:
             changed = (chars != prev[0]) | (fgp != prev[1]) | (bgp != prev[2])
         self.prev = (chars.copy(), fgp, bgp)
-        rows = np.nonzero(changed.any(axis=1))[0]
-        if not rows.size:
+        if not changed.any():
             return ""
-        out = ["\x1b[?2026h"]
-        lf = lb = -1
-        for y in rows.tolist():
-            xs = np.nonzero(changed[y])[0]
-            cut = np.nonzero(np.diff(xs) > self.GAP + 1)[0]
-            starts, ends = np.r_[xs[0], xs[cut + 1]].tolist(), np.r_[xs[cut], xs[-1]].tolist()
-            rf, rb, rc = fgp[y].tolist(), bgp[y].tolist(), chars[y].tolist()
-            for x0, x1 in zip(starts, ends):
-                out.append(f"\x1b[{y + 1};{x0 + 1}H")
-                for x in range(x0, x1 + 1):
-                    b = rb[x]
-                    if b != lb:
-                        out.append(f"\x1b[48;2;{b >> 16};{(b >> 8) & 255};{b & 255}m")
-                        lb = b
-                    c = rc[x]
-                    f = rf[x]
-                    if c == 32 or (c == 0x2580 and f == b):
-                        out.append(" ")
-                        continue
-                    if f != lf:
-                        out.append(f"\x1b[38;2;{f >> 16};{(f >> 8) & 255};{f & 255}m")
-                        lf = f
-                    out.append(chr(c))
-        out.append("\x1b[0m\x1b[?2026l")
-        return "".join(out)
+        cols = chars.shape[1]
+        ar = np.arange(cols)
+        prev_x = np.maximum.accumulate(np.where(changed, ar, -cols - self.GAP), axis=1)
+        next_x = np.minimum.accumulate(np.where(changed, ar, 2 * cols + self.GAP)[:, ::-1], axis=1)[:, ::-1]
+        emit = changed | (next_x - prev_x <= self.GAP + 1)
+        ys, xs = np.nonzero(emit)
+        n = ys.size
+        c, f, b = chars[ys, xs], fgp[ys, xs], bgp[ys, xs]
+        start = np.ones(n, bool)
+        start[1:] = (ys[1:] != ys[:-1]) | (xs[1:] != xs[:-1] + 1)
+        blank = (c == 32) | ((c == 0x2580) & (f == b))
+        bg_new = np.ones(n, bool)
+        bg_new[1:] = b[1:] != b[:-1]
+        last = np.maximum.accumulate(np.where(blank, -1, np.arange(n)))
+        prev = np.r_[-1, last[:-1]]
+        fg_new = ~blank & ((prev < 0) | (f != f[np.maximum(prev, 0)]))
+        parts = np.full((n, 4), "", object)
+        parts[start, 0] = [f"\x1b[{y + 1};{x + 1}H" for y, x in zip(ys[start].tolist(), xs[start].tolist())]
+        parts[bg_new, 1] = self.codes(b[bg_new], 48)
+        parts[fg_new, 2] = self.codes(f[fg_new], 38)
+        glyph = np.where(blank, 32, c)
+        uniq, inv = np.unique(glyph, return_inverse=True)
+        parts[:, 3] = np.array([chr(u) for u in uniq.tolist()], object)[inv]
+        return "\x1b[?2026h" + "".join(parts.ravel().tolist()) + "\x1b[0m\x1b[?2026l"
+
+    @staticmethod
+    def codes(colors, kind):
+        uniq, inv = np.unique(colors, return_inverse=True)
+        table = np.array([f"\x1b[{kind};2;{u >> 16};{(u >> 8) & 255};{u & 255}m" for u in uniq.tolist()], object)
+        return table[inv]
 
 
 class Canvas:
@@ -505,7 +509,8 @@ class App:
     def object_altaz(self, key):
         if key.startswith(("star:", "con:")):
             if key.startswith("star:"):
-                v = self.cat.vectors(self.snap.jd)[int(key[5:])] @ self.snap.hor.T
+                i = int(key[5:])
+                v = self.cat.vectors(self.snap.jd, i + 1)[i] @ self.snap.hor.T
             else:
                 v = self.cons.label_vec[self.cons.codes.index(key[4:])] @ self.snap.hor.T
             if self.view.atmosphere:

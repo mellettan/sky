@@ -553,13 +553,16 @@ class StarCatalog:
         self.e_ra = np.stack([-sa, ca, np.zeros_like(sa)], axis=-1)
         self.e_dec = np.stack([-sd * ca, -sd * sa, cd], axis=-1)
         self._cache_year = None
-        self._cache_vec = self.base
+        self._cache_vec = self.base[:0]
 
-    def vectors(self, jd):
+    def vectors(self, jd, n=None):
+        """Направления на звёзды с учётом собственного движения; считаются только первые n самых ярких."""
+        n = len(self.base) if n is None else min(n, len(self.base))
         years = (jd - J2000) / 365.25
         key = round(years, 1)
-        if key != self._cache_year:
-            v = self.base + years * (self.pmra[:, None] * self.e_ra + self.pmdec[:, None] * self.e_dec)
+        if key != self._cache_year or n > len(self._cache_vec):
+            m = max(n, len(self._cache_vec)) if key == self._cache_year else n
+            v = self.base[:m] + key * (self.pmra[:m, None] * self.e_ra[:m] + self.pmdec[:m, None] * self.e_dec[:m])
             v /= np.linalg.norm(v, axis=1, keepdims=True)
             self._cache_vec = v
             self._cache_year = key
@@ -601,6 +604,7 @@ class Constellations:
                 vecs.append(v / np.linalg.norm(v))
                 self.codes.append(con)
         self.seg = np.array(sorted(seg), int).reshape(-1, 2)
+        self.stars = int(self.seg.max()) + 1 if len(self.seg) else 0
         self.label_vec = np.array(vecs).reshape(-1, 3)
 
     def __len__(self):

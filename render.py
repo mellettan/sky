@@ -121,10 +121,10 @@ class SkyCtx:
     moon_r: float = 0.27
 
 
-def mw_intensity(v_eq):
-    g = v_eq @ astro.EQ_TO_GAL.T
-    l = np.degrees(np.arctan2(g[..., 1], g[..., 0]))
-    b = np.degrees(np.arcsin(np.clip(g[..., 2], -1, 1)))
+MW_STEP = 0.5
+
+
+def mw_galactic(l, b):
     lw = (l + 180.0) % 360.0 - 180.0
     width = 6.0 + 5.0 * np.exp(-(lw / 60.0) ** 2)
     core = np.exp(-(b / width) ** 2)
@@ -137,51 +137,114 @@ def mw_intensity(v_eq):
     return (core * along + bulge) * clump * rift + lmc + smc
 
 
+_mw_table = None
+
+
+def mw_table():
+    global _mw_table
+    if _mw_table is None:
+        b, l = np.mgrid[-90:90 + MW_STEP:MW_STEP, 0:360 + MW_STEP:MW_STEP]
+        _mw_table = mw_galactic(l, b)
+    return _mw_table
+
+
+def mw_intensity(v_eq):
+    """Яркость Млечного Пути: таблица по галактическим координатам с шагом 0.5° и билинейная интерполяция."""
+    t = mw_table()
+    g = v_eq @ astro.EQ_TO_GAL.T
+    x = (np.degrees(np.arctan2(g[..., 1], g[..., 0])) % 360.0) / MW_STEP
+    y = (np.degrees(np.arcsin(np.clip(g[..., 2], -1, 1))) + 90.0) / MW_STEP
+    x0 = np.minimum(x.astype(int), t.shape[1] - 2)
+    y0 = np.minimum(y.astype(int), t.shape[0] - 2)
+    fx, fy = x - x0, y - y0
+    top = t[y0, x0] * (1 - fx) + t[y0, x0 + 1] * fx
+    bot = t[y0 + 1, x0] * (1 - fx) + t[y0 + 1, x0 + 1] * fx
+    return top * (1 - fy) + bot * fy
+
+
+class Mix:
+    """Цвет как сумма слоёв: вес на каждый пиксель, умноженный на цвет слоя."""
+
+    def __init__(self, n):
+        self.n = n
+        self.w = []
+        self.c = []
+
+    def add(self, w, col):
+        self.w.append(w)
+        self.c.append(col)
+
+    def scale(self, k):
+        self.w = [w * k for w in self.w]
+
+    def result(self, k=1.0):
+        w = np.empty((len(self.w), self.n))
+        for i, wi in enumerate(self.w):
+            w[i] = wi * k
+        return (np.array(self.c, float).T @ w).T
+
+
 def sky_colors(v, ctx):
-    alt = np.degrees(np.arcsin(np.clip(v[..., 2], -1, 1)))
-    v_eq = v @ ctx.hor
-    mw = mw_intensity(v_eq)[..., None] * ctx.mw_vis
+    n = v.shape[0]
+    alt = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1)))
+    mix = Mix(n)
+    mw = mw_intensity(v @ ctx.hor) * ctx.mw_vis if ctx.mw_vis > 0 else None
     if not ctx.atmosphere:
-        return np.array([3, 3, 7], float) + MW_COL * mw * 1.3
+        mix.add(1.0, (3, 3, 7))
+        if mw is not None:
+            mix.add(mw * 1.3, MW_COL)
+        return np.clip(mix.result(), 0, 255)
     s = ctx.sun_alt
-    hz = np.exp(-np.maximum(alt, 0) / 14.0)[..., None]
-    below = np.clip(1 + np.minimum(alt, 0) / 25.0, 0.3, 1.0)[..., None]
+    hz = np.exp(-np.maximum(alt, 0) / 14.0)
+    hz8 = hz ** 0.8
+    below = np.clip(1 + np.minimum(alt, 0) / 25.0, 0.3, 1.0)
     g = BORTLE_GLOW[ctx.bortle - 1]
-    col = NIGHT_ZENITH + (NIGHT_HORIZON - NIGHT_ZENITH) * hz
-    col = col + g * (GLOW_ZENITH + (GLOW_HORIZON - GLOW_ZENITH) * hz ** 0.8)
-    col = col + MW_COL * mw * (1 - 0.65 * hz)
-    tw = smoothstep(-18.0, -2.0, s) ** 1.6
+    mix.add(1 - hz, NIGHT_ZENITH)
+    mix.add(hz, NIGHT_HORIZON)
+    if g > 0:
+        mix.add(g * (1 - hz8), GLOW_ZENITH)
+        mix.add(g * hz8, GLOW_HORIZON)
+    if mw is not None:
+        mix.add(mw * (1 - 0.65 * hz), MW_COL)
+    tw = float(smoothstep(-18.0, -2.0, s)) ** 1.6
     if tw > 0:
         sun_h = ctx.sun[:2] / max(np.linalg.norm(ctx.sun[:2]), 1e-9)
-        vh = v[..., :2] / np.maximum(np.linalg.norm(v[..., :2], axis=-1, keepdims=True), 1e-9)
-        sf = ((1 + vh @ sun_h) / 2)[..., None] ** 2
-        horizon = TW_ANTI + (TW_SUN - TW_ANTI) * sf
-        col = col + tw * (TW_ZENITH + (horizon - TW_ZENITH) * hz ** 0.8)
-    day = smoothstep(-4.0, 10.0, s)
+        sf = ((1 + (v[:, 0] * sun_h[0] + v[:, 1] * sun_h[1]) / np.maximum(np.hypot(v[:, 0], v[:, 1]), 1e-9)) / 2) ** 2
+        mix.add(tw * (1 - hz8), TW_ZENITH)
+        mix.add(tw * hz8 * (1 - sf), TW_ANTI)
+        mix.add(tw * hz8 * sf, TW_SUN)
+    day = float(smoothstep(-4.0, 10.0, s))
     if day > 0:
-        col = col + (DAY_ZENITH + (DAY_HORIZON - DAY_ZENITH) * hz - col) * day
-    ang_sun = np.degrees(np.arccos(np.clip(v @ ctx.sun, -1, 1)))[..., None]
-    glare = smoothstep(-8.0, 2.0, s)
+        mix.scale(1 - day)
+        mix.add(day * (1 - hz), DAY_ZENITH)
+        mix.add(day * hz, DAY_HORIZON)
+    glare = float(smoothstep(-8.0, 2.0, s))
+    ang_sun = None
+    if glare > 0 or ctx.total:
+        ang_sun = np.degrees(np.arccos(np.clip(v @ ctx.sun, -1, 1)))
     if glare > 0:
-        col = col + SUN_GLARE * (0.5 * np.exp(-ang_sun / 3.0) + 0.25 * day * np.exp(-ang_sun / 25.0)) * glare
+        mix.add((0.5 * np.exp(-ang_sun / 3.0) + 0.25 * day * np.exp(-ang_sun / 25.0)) * glare, SUN_GLARE)
+    ang_moon = None
+    if ctx.moon_k > 0 or ctx.total:
+        ang_moon = np.degrees(np.arccos(np.clip(v @ ctx.moon, -1, 1)))
     if ctx.moon_k > 0:
-        ang_moon = np.degrees(np.arccos(np.clip(v @ ctx.moon, -1, 1)))[..., None]
-        col = col + ctx.moon_k * (1 - day) * (np.array([55, 60, 72]) * np.exp(-ang_moon / 7.0)
-                                               + np.array([14, 18, 30]) * (0.5 + 0.5 * hz))
+        k = ctx.moon_k * (1 - day)
+        mix.add(k * np.exp(-ang_moon / 7.0), (55, 60, 72))
+        mix.add(k * (0.5 + 0.5 * hz), (14, 18, 30))
     if ctx.ecl < 1.0:
-        dark = ECL_ZENITH + (ECL_HORIZON - ECL_ZENITH) * hz ** 1.5
-        col = dark + (col - dark) * ctx.ecl
+        hz15 = hz ** 1.5
+        mix.scale(ctx.ecl)
+        mix.add((1 - ctx.ecl) * (1 - hz15), ECL_ZENITH)
+        mix.add((1 - ctx.ecl) * hz15, ECL_HORIZON)
     if ctx.total:
         e1 = np.cross(ctx.sun, [0.0, 0.0, 1.0])
         e1 /= max(np.linalg.norm(e1), 1e-9)
         e2 = np.cross(ctx.sun, e1)
-        pa = np.arctan2(v @ e2, v @ e1)[..., None]
-        ang_moon = np.degrees(np.arccos(np.clip(v @ ctx.moon, -1, 1)))[..., None]
+        pa = np.arctan2(v @ e2, v @ e1)
         x = np.maximum(ang_sun - ctx.moon_r, 0) / max(ctx.sun_r, 1e-4)
         rays = 0.6 + 0.4 * np.cos(2 * pa) ** 2 + 0.15 * np.cos(7 * pa + 1.3)
-        corona = np.exp(-x / (0.35 * rays)) * (ang_moon > ctx.moon_r)
-        col = col + CORONA * corona
-    return np.clip(col * below, 0, 255)
+        mix.add(np.exp(-x / (0.35 * rays)) * (ang_moon > ctx.moon_r), CORONA)
+    return np.clip(mix.result(below), 0, 255)
 
 
 def sizes_for(mag):
@@ -194,6 +257,9 @@ class Renderer:
         self.con = constellations
         self.scene = Scene()
         self._geo_key = None
+        self._pix_key = None
+        self._pix = None
+        mw_table()
         self._geo = None
 
     def eclipse_light(self, view, snap, sun_alt):
@@ -230,11 +296,7 @@ class Renderer:
                      ecl, snap.total and view.atmosphere, math.degrees(snap.sun.radius_rad),
                      math.degrees(snap.moon.radius_rad))
 
-        hy, hx = np.mgrid[0:rows * 2, 0:cols]
-        v = cam.unproject((hx + 0.5) * 2.0, (hy + 0.5) * 2.0)
-        flat = v.reshape(-1, 3)
-        alt = np.degrees(np.arcsin(np.clip(flat[:, 2], -1, 1)))
-        az = np.degrees(np.arctan2(flat[:, 0], flat[:, 1])) % 360.0
+        flat, alt, az = self._pixels(view, cols, rows, cam)
         half = sky_colors(flat, ctx)
         land = np.zeros(flat.shape[0], bool)
         if view.landscape:
@@ -286,6 +348,16 @@ class Renderer:
         self._cardinals(frame, view, rows, cols)
         return frame
 
+    def _pixels(self, view, cols, rows, cam):
+        key = (view.az, view.alt, view.fov, view.shift, cols, rows)
+        if key != self._pix_key:
+            hy, hx = np.mgrid[0:rows * 2, 0:cols]
+            flat = cam.unproject((hx + 0.5) * 2.0, (hy + 0.5) * 2.0).reshape(-1, 3)
+            alt = np.degrees(np.arcsin(np.clip(flat[:, 2], -1, 1)))
+            az = np.degrees(np.arctan2(flat[:, 0], flat[:, 1])) % 360.0
+            self._pix, self._pix_key = (flat, alt, az), key
+        return self._pix
+
     def ambient(self, sun_alt, moon_k, bortle):
         level = 0.02 + 0.98 * float(smoothstep(-10.0, 8.0, sun_alt)) ** 1.2 + 0.05 * moon_k + 0.004 * bortle
         t = float(smoothstep(-6.0, 10.0, sun_alt))
@@ -330,7 +402,7 @@ class Renderer:
         empty = (np.zeros(0), np.zeros(0), np.zeros(0, int), np.zeros(0))
         if n == 0:
             return empty
-        vec = self.cat.vectors(snap.jd)[:n] @ snap.hor.T
+        vec = self.cat.vectors(snap.jd, n)[:n] @ snap.hor.T
         if view.atmosphere:
             near = vec @ cam.f > math.cos(self._reach(view))
             vec[near] = astro.refract(vec[near])
@@ -373,7 +445,7 @@ class Renderer:
 
     def _constellations(self, view, snap, cam, land, half, dots, cell_col, cell_pri, rows, cols):
         seg = self.con.seg
-        vec = self.cat.vectors(snap.jd)
+        vec = self.cat.vectors(snap.jd, self.con.stars)
         a, b = vec[seg[:, 0]] @ snap.hor.T, vec[seg[:, 1]] @ snap.hor.T
         if view.atmosphere:
             a, b = astro.refract(a), astro.refract(b)
