@@ -462,7 +462,7 @@ class Scene:
         if near.any():
             a, al, f = across[near], along[near], edge[near]
             half = 1.7 + 0.15 * np.sin(al / 9.0 + 1.3) + 0.1 * np.sin(al / 3.7)
-            road = inside(np.minimum(half - a, np.minimum(al + 4, self.road_len - al)), f)
+            road = inside(np.minimum(half - a, np.minimum(al + 4, self.road_len - al)), 0.5 * f)
             col[near] = col[near] * (1 - road) + ROAD * road
         return col
 
