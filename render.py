@@ -31,6 +31,8 @@ ECL_ZENITH = np.array([14, 20, 46], float)
 ECL_HORIZON = np.array([196, 124, 70], float)
 CORONA = np.array([236, 240, 255], float)
 CON_LINE = np.array([62, 92, 156], float)
+UMBRA_CORE = np.array([88, 30, 16], float)
+UMBRA_EDGE = np.array([176, 84, 44], float)
 
 BRAILLE_BITS = np.array([[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]], np.int32)
 PLUS = [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -205,6 +207,8 @@ class Renderer:
         sun_alt = math.degrees(math.asin(snap.sun.vec[2]))
         moon_alt = math.degrees(math.asin(snap.moon.vec[2]))
         moon_k = snap.moon.phase ** 2 * float(smoothstep(-1.0, 12.0, moon_alt))
+        if snap.lunar:
+            moon_k *= snap.lunar.light
         if view.atmosphere:
             lim_sun = float(np.interp(sun_alt, [-18, -15, -12, -9, -6, -3, 0, 10],
                                       [9, 6.5, 4.5, 3.0, 1.8, 0.0, -2.5, -4.5]))
@@ -535,6 +539,8 @@ class Renderer:
                 col[(np.abs(lat) > 18) & (np.abs(lat) < 34)] *= np.array([0.88, 0.82, 0.72])
             elif b.key == "Марс":
                 col[np.abs(lat) > 72] = (245, 240, 235)
+        if b.kind == "moon" and snap.lunar and snap.lunar.penumbral > 0:
+            col = self._umbra(col, b, snap.lunar, dx, dy, rgt, u, f)
         if b.kind == "moon":
             dark = disk & ~lit
             dots[gy[dark], gx[dark]] = False
@@ -561,6 +567,16 @@ class Renderer:
         if not px.size:
             return
         self._plot_avg(px, py, col[draw], 10.0, land, dots, cell_col, cell_pri, rows, cols)
+
+    def _umbra(self, col, b, sh, dx, dy, rgt, u, f):
+        pt = f + (dx[..., None] * rgt - dy[..., None] * u) * b.radius_rad
+        pt /= np.linalg.norm(pt, axis=-1, keepdims=True)
+        d = np.arccos(np.clip(pt @ sh.center, -1, 1))
+        light = astro.shadow_light(d, sh.umbra, sh.penumbra)
+        lum = col.mean(axis=-1, keepdims=True) / np.mean(b.color)
+        t = np.clip(d / sh.umbra, 0, 1)[..., None]
+        copper = (UMBRA_CORE + (UMBRA_EDGE - UMBRA_CORE) * t ** 2) * lum * max((1 - math.sqrt(sh.light)) ** 1.5, 0.12)
+        return np.where((d < sh.umbra)[..., None], copper, col * light[..., None] ** 0.6)
 
     def _maria(self, col, normal, pole, f):
         e = -f

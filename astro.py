@@ -14,6 +14,9 @@ AU_KM = 149597870.7
 EARTH_R_KM = 6378.14
 LIGHT_DAY_PER_AU = 0.0057755183
 EPOCH_UNIX = datetime(1970, 1, 1, tzinfo=timezone.utc)
+SUN_R_KM = 695700.0
+MOON_R_KM = 1737.4
+UMBRA_LIGHT = 2e-4
 JD_MIN = 1721426.5 + 1
 JD_MAX = 5373484.5 - 1
 
@@ -357,6 +360,17 @@ class Body:
 
 
 @dataclass
+class Shadow:
+    """Тень Земли на расстоянии Луны: направление оси и радиусы для наблюдателя, фазы затмения геоцентрические."""
+    center: np.ndarray
+    umbra: float
+    penumbra: float
+    umbral: float
+    penumbral: float
+    light: float
+
+
+@dataclass
 class Snapshot:
     jd: float
     lat: float
@@ -368,6 +382,7 @@ class Snapshot:
     bodies: list
     eclipse: float = 0.0
     total: bool = False
+    lunar: Shadow | None = None
 
 
 def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
@@ -397,7 +412,7 @@ def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
             phase = (1 + float(np.dot(-geo, to_sun) / (dist * n))) / 2
         return Body(key, name, kind, v, dist, mag, color, radius_km / (dist * AU_KM), to_sun_h, phase, extra or {})
 
-    sun = make("sun", "Солнце", "sun", sun_geo, -26.74, (255, 240, 175), 695700.0)
+    sun = make("sun", "Солнце", "sun", sun_geo, -26.74, (255, 240, 175), SUN_R_KM)
     bodies = [sun]
 
     moon_date = moon_geo_of_date(jd) * (EARTH_R_KM / AU_KM)
@@ -405,7 +420,9 @@ def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
     to_sun = sun_geo - moon_geo
     i_deg = math.degrees(math.acos(np.clip(np.dot(-moon_geo, to_sun) / (np.linalg.norm(moon_geo) * np.linalg.norm(to_sun)), -1, 1)))
     moon_mag = -12.73 + 0.026 * i_deg + 4e-9 * i_deg ** 4
-    moon = make("moon", "Луна", "moon", moon_geo, moon_mag, (235, 235, 225), 1737.4, {"waxing": None})
+    moon = make("moon", "Луна", "moon", moon_geo, moon_mag, (235, 235, 225), MOON_R_KM, {"waxing": None})
+    lunar = earth_shadow(sun_geo + obs, moon_geo + obs, obs, apparent)
+    moon.mag -= 2.5 * math.log10(lunar.light)
     ecl_n = ECL_TO_EQ @ np.array([0, 0, 1.0])
     moon.extra["waxing"] = float(np.dot(np.cross(sun_geo, moon_geo), ecl_n)) > 0
     bodies.append(moon)
@@ -450,7 +467,35 @@ def compute_snapshot(jd_ut, lat, lon, comets, refraction=True):
         bodies.append(b)
 
     cov, total = eclipse(sun, moon)
-    return Snapshot(jd_ut, lat, lon, lst, hor, sun, moon, bodies, cov, total)
+    return Snapshot(jd_ut, lat, lon, lst, hor, sun, moon, bodies, cov, total, lunar)
+
+
+def shadow_light(d, umbra, penumbra):
+    """Доля солнечного света в тени Земли на угловом расстоянии d от её оси."""
+    t = np.clip((d - umbra) / (penumbra - umbra), 0.0, 1.0)
+    return np.where(d < umbra, UMBRA_LIGHT, t * t * (3 - 2 * t))
+
+
+_gy, _gx = np.mgrid[-1:1:21j, -1:1:21j]
+_DISK = np.stack([_gx[_gx ** 2 + _gy ** 2 <= 1], _gy[_gx ** 2 + _gy ** 2 <= 1]], axis=-1)
+
+
+def earth_shadow(sun_g, moon_g, obs, apparent):
+    dm, ds = float(np.linalg.norm(moon_g)), float(np.linalg.norm(sun_g))
+    re = EARTH_R_KM / AU_KM
+    pm, ps, ss = math.asin(re / dm), math.asin(re / ds), math.asin(SUN_R_KM / AU_KM / ds)
+    sm = math.asin(MOON_R_KM / AU_KM / dm)
+    umbra, penumbra = 1.01 * pm + ps - ss, 1.01 * pm + ps + ss
+    axis = -sun_g / ds
+    d = math.acos(float(np.clip(axis @ moon_g / dm, -1, 1)))
+    umbral, penumbral = (umbra + sm - d) / (2 * sm), (penumbra + sm - d) / (2 * sm)
+    light = 1.0
+    if penumbral > 0:
+        dist = np.hypot(d + sm * _DISK[:, 0], sm * _DISK[:, 1])
+        light = float(shadow_light(dist, umbra, penumbra).mean())
+    point = axis * dm - obs
+    k = dm / float(np.linalg.norm(point))
+    return Shadow(apparent(point / np.linalg.norm(point)), umbra * k, penumbra * k, umbral, penumbral, light)
 
 
 def eclipse(sun, moon):

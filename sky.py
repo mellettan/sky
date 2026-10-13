@@ -643,6 +643,7 @@ class App:
         if b.kind == "sun":
             return ["Солнце", ecl, f"{b.dist_au:.3f} а.е.", where]
         if b.kind == "moon":
+            ecl = self.lunar_text(snap.lunar) or ecl
             phase = "растущая" if b.extra.get("waxing") else "убывающая"
             km = b.dist_au * astro.AU_KM
             return ["Луна", ecl, f"Освещена на {b.phase * 100:.0f}%, {phase} · {km:,.0f} км".replace(",", " "), where]
@@ -650,6 +651,16 @@ class App:
             return [b.name, f"блеск {b.mag:.1f} · {b.dist_au:.2f} а.е. от Земли", where]
         return [b.name, f"{b.extra['des']} · блеск {b.mag:.1f}",
                 f"{b.extra['r']:.2f} а.е. от Солнца · {b.dist_au:.2f} а.е. от Земли", where]
+
+    @staticmethod
+    def lunar_text(sh):
+        if sh is None or sh.penumbral <= 0:
+            return ""
+        if sh.umbral >= 1:
+            return f"Полное лунное затмение, фаза {sh.umbral:.2f}"
+        if sh.umbral > 0:
+            return f"Частное лунное затмение, фаза {sh.umbral:.2f}"
+        return f"Полутеневое лунное затмение, фаза {sh.penumbral:.2f}"
 
     def draw_tooltip(self, cv, sky_rows):
         if self.mouse is None or self.drag or self.prompt or self.help:
