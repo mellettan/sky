@@ -368,6 +368,7 @@ class App:
             v.az, v.alt, v.fov, v.bortle = wall.az % 360, wall.alt, wall.fov, wall.bortle
             v.labels = not wall.no_labels
             v.landscape = not wall.no_landscape
+            v.atmosphere = True
             v.constellations = wall.constellations and len(self.cons) > 0
             v.shift = 0.5 - wall.horizon
             if wall.place:
